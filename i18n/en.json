@@ -5,7 +5,6 @@
   "state.finished": "Finished",
   "state.failed": "Failed",
   "state.idle": "Idle",
-
   "conn.starting": "Starting…",
   "conn.notConfigured": "Not set up",
   "conn.connecting": "Connecting…",
@@ -14,28 +13,23 @@
   "conn.denied": "Login rejected – check the access code",
   "conn.disconnected": "Disconnected",
   "conn.failed": "Error: %1",
-
   "bar.progress": "%1% · %2",
   "bar.paused": "Paused",
   "bar.done": "Done",
   "bar.failed": "Failed",
-
   "time.hoursMinutes": "%1h %2m",
   "time.minutes": "%1m",
-
   "print.layer": "Layer %1/%2",
   "print.left": "%1 left",
   "temp.nozzle": "Nozzle %1° / %2°",
   "temp.bed": "Bed %1° / %2°",
-  "ams.humidity": "AMS %1 humidity",
+  "ams.humidity": "Humidity %1",
   "ams.level": "Level %1/5",
   "total.label": "Total print time",
   "total.hint": "Counted while BambuBar is running; the printer doesn't report its lifetime hours.",
   "hint.keys": "r refresh · s settings · esc close",
-
   "action.refresh": "Refresh (r)",
   "action.settings": "Settings (s)",
-
   "form.title": "Printer",
   "form.intro": "The printer must be in LAN mode. IP address, serial number and access code are on the printer's screen under Settings → WLAN / Device.",
   "form.host": "IP address",
@@ -46,7 +40,6 @@
   "form.save": "Save",
   "form.saving": "Saving…",
   "form.cancel": "Cancel",
-
   "error.invalid-host": "That isn't a valid IP address or host name.",
   "error.invalid-serial": "The serial number can only contain letters and digits.",
   "error.invalid-code": "The access code can't contain spaces.",
@@ -54,5 +47,19 @@
   "error.demo": "Settings can't be changed in demo mode.",
   "error.bridge": "The BambuBar helper isn't running. Try again in a moment.",
   "warning.keyring": "Saved, but the access code couldn't go into the keyring, so you'll have to enter it again after a restart.",
-  "warning.config": "Connected, but the settings file couldn't be written, so you'll have to enter them again after a restart."
+  "warning.config": "Connected, but the settings file couldn't be written, so you'll have to enter them again after a restart.",
+  "conn.untrusted": "Certificate changed",
+  "conn.wrongPrinter": "Wrong printer at this address",
+  "ams.name": "AMS %1",
+  "ams.htName": "AMS HT %1",
+  "ams.external": "External spool",
+  "temp.left": "Left %1° / %2°",
+  "temp.right": "Right %1° / %2°",
+  "trust.changed": "The printer at %1 shows a different certificate than the one saved. That happens after a factory reset, or when another device has taken the printer's address. The access code was not sent.",
+  "trust.wrong": "The device at %1 identifies itself as %2, not %3. Check the IP address in the settings. The access code was not sent.",
+  "trust.button": "Trust new certificate",
+  "action.settingsButton": "Settings",
+  "form.certificate": "Pinned certificate: %1",
+  "notify.finished": "Print finished",
+  "notify.failed": "Print failed"
 }

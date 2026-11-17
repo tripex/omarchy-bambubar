@@ -22,7 +22,13 @@ Panel {
   readonly property bool showProgress: boolSetting("showProgress", true) && !(bar && bar.vertical)
   property bool editing: false
   readonly property bool showForm: editing || (printer.configLoaded && !printer.configured && !printer.isDemo)
-  readonly property bool failedState: printer.status === "denied" || (printer.connected && printer.gcodeState === "FAILED")
+  readonly property bool identityProblem: printer.status === "untrusted" || printer.status === "wrongPrinter"
+  readonly property bool failedState: printer.status === "denied" || identityProblem
+    || (printer.connected && printer.gcodeState === "FAILED")
+  readonly property bool notifyEnabled: boolSetting("notify", true)
+  // External spools with something loaded; empty holders are left out.
+  readonly property var loadedExternal: printer.external.filter(function(t) { return !t.empty })
+  property string previousState: ""
 
   readonly property string barLabel: {
     if (!showProgress || !printer.connected) return ""
@@ -73,8 +79,48 @@ Panel {
     case "denied": return strings.t("conn.denied")
     case "disconnected": return strings.t("conn.disconnected")
     case "failed": return strings.t("conn.failed").arg(printer.statusDetail)
+    case "untrusted": return strings.t("conn.untrusted")
+    case "wrongPrinter": return strings.t("conn.wrongPrinter")
     default: return strings.t("conn.starting")
     }
+  }
+
+  function amsName(id) {
+    var n = parseInt(id, 10) || 0
+    // AMS HT units are numbered from 128.
+    return n >= 128 ? strings.t("ams.htName").arg(n - 127) : strings.t("ams.name").arg(n + 1)
+  }
+
+  function trayLabel(tray) {
+    if (!tray || tray.empty) return "–"
+    return tray.name || tray.type || "?"
+  }
+
+  function isActiveTray(unitId, tray) {
+    var a = printer.activeSpool
+    if (!a || !tray) return false
+    return unitId === null ? a.external === tray.id : (a.ams === unitId && a.tray === tray.id)
+  }
+
+  function nozzleById(id) {
+    for (var i = 0; i < printer.nozzles.length; i++)
+      if (printer.nozzles[i].id === id) return printer.nozzles[i]
+    return { temp: 0, target: 0 }
+  }
+
+  function shortFingerprint(f) {
+    return f.length === 64 ? f.substring(0, 8) + "…" + f.substring(56) : ""
+  }
+
+  // Notification text goes to a daemon that may read markup.
+  function plain(text) {
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  }
+
+  function notifyDone(failed) {
+    var title = strings.t(failed ? "notify.failed" : "notify.finished")
+    var body = printer.job !== "" ? plain(printer.job) : "BambuBar"
+    Quickshell.execDetached(["notify-send", "-a", "BambuBar", "-u", failed ? "critical" : "normal", "--", title, body])
   }
 
   function degrees(value) {
@@ -155,6 +201,17 @@ Panel {
     onConfigReceived: if (!root.editing) {
       hostField.text = host
       serialField.text = serial
+    }
+
+    // Only a print seen running ends in a notification, not a finished one
+    // found on connecting.
+    onGcodeStateChanged: {
+      var previous = root.previousState
+      root.previousState = gcodeState
+      if (!root.notifyEnabled || isDemo) return
+      if (previous !== "RUNNING" && previous !== "PAUSE" && previous !== "PREPARE") return
+      if (gcodeState === "FINISH") root.notifyDone(false)
+      else if (gcodeState === "FAILED") root.notifyDone(true)
     }
   }
 
@@ -270,6 +327,48 @@ Panel {
           width: parent.width
           spacing: Style.space(10)
 
+          // The certificate at the printer's address isn't the pinned one, or
+          // names another serial. The access code was held back either way.
+          Column {
+            visible: root.identityProblem
+            width: parent.width
+            spacing: Style.space(8)
+
+            Caption {
+              width: parent.width
+              text: printer.status === "untrusted"
+                ? strings.t("trust.changed").arg(printer.host)
+                : strings.t("trust.wrong").arg(printer.host).arg(printer.statusDetail || "?").arg(printer.serial)
+              color: root.urgent
+              wrapMode: Text.WordWrap
+            }
+
+            RowLayout {
+              width: parent.width
+              Item { Layout.fillWidth: true }
+
+              Button {
+                visible: printer.status === "wrongPrinter"
+                text: strings.t("action.settingsButton")
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: root.startEditing()
+              }
+
+              Button {
+                visible: printer.status === "untrusted"
+                text: strings.t("trust.button")
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                onClicked: printer.trust()
+              }
+            }
+          }
+
           Caption {
             visible: printer.job !== ""
             width: parent.width
@@ -314,31 +413,87 @@ Panel {
 
           PanelSeparator { foreground: root.foreground }
 
+          // Dual-nozzle printers (H2D, X2D): both nozzles, the printing one
+          // in full strength.
           RowLayout {
+            visible: printer.nozzles.length >= 2
             width: parent.width
             Caption {
-              text: strings.t("temp.nozzle").arg(root.degrees(printer.nozzle)).arg(root.degrees(printer.nozzleTarget))
+              text: strings.t("temp.left").arg(root.degrees(root.nozzleById(1).temp)).arg(root.degrees(root.nozzleById(1).target))
+              color: printer.activeNozzle === 1 ? root.foreground : root.dim
+              font.bold: printer.activeNozzle === 1
             }
             Item { Layout.fillWidth: true }
             Caption {
+              text: strings.t("temp.right").arg(root.degrees(root.nozzleById(0).temp)).arg(root.degrees(root.nozzleById(0).target))
+              color: printer.activeNozzle === 0 ? root.foreground : root.dim
+              font.bold: printer.activeNozzle === 0
+            }
+          }
+
+          // Nozzle left and bed right; with two nozzles above, the bed alone on the left.
+          RowLayout {
+            width: parent.width
+            Caption {
+              visible: printer.nozzles.length < 2
+              text: strings.t("temp.nozzle").arg(root.degrees(printer.nozzle)).arg(root.degrees(printer.nozzleTarget))
+            }
+            Item {
+              visible: printer.nozzles.length < 2
+              Layout.fillWidth: true
+            }
+            Caption {
               text: strings.t("temp.bed").arg(root.degrees(printer.bed)).arg(root.degrees(printer.bedTarget))
+            }
+            Item {
+              visible: printer.nozzles.length >= 2
+              Layout.fillWidth: true
             }
           }
 
           PanelSeparator {
-            visible: printer.ams.length > 0
+            visible: printer.ams.length > 0 || root.loadedExternal.length > 0
             foreground: root.foreground
           }
 
           Repeater {
             model: printer.ams
 
-            RowLayout {
+            Column {
+              id: unit
               required property var modelData
               width: parent.width
-              Caption { text: strings.t("ams.humidity").arg((parseInt(modelData.id, 10) || 0) + 1) }
-              Item { Layout.fillWidth: true }
-              Caption { text: root.amsValue(modelData) }
+              spacing: Style.space(6)
+
+              RowLayout {
+                width: parent.width
+                FieldLabel { text: root.amsName(unit.modelData.id) }
+                Item { Layout.fillWidth: true }
+                Caption {
+                  text: strings.t("ams.humidity").arg(root.amsValue(unit.modelData))
+                  color: root.dim
+                }
+              }
+
+              SpoolRow {
+                visible: trays.length > 0
+                width: parent.width
+                unitId: unit.modelData.id
+                trays: unit.modelData.trays || []
+              }
+            }
+          }
+
+          Column {
+            visible: root.loadedExternal.length > 0
+            width: parent.width
+            spacing: Style.space(6)
+
+            FieldLabel { text: strings.t("ams.external") }
+            SpoolRow {
+              width: parent.width
+              unitId: null
+              trays: root.loadedExternal
             }
           }
 
@@ -420,6 +575,14 @@ Panel {
           }
 
           Caption {
+            visible: printer.fingerprint !== ""
+            width: parent.width
+            text: strings.t("form.certificate").arg(root.shortFingerprint(printer.fingerprint))
+            color: root.dim
+            wrapMode: Text.WordWrap
+          }
+
+          Caption {
             visible: printer.saveError !== "" || printer.saveWarning !== ""
             width: parent.width
             text: printer.saveError !== "" ? strings.t("error." + printer.saveError) : strings.t("warning." + printer.saveWarning)
@@ -476,5 +639,44 @@ Panel {
   component FieldLabel: Caption {
     color: root.dim
     font.bold: true
+  }
+
+  // Spools in four columns, so the slots of every AMS line up (an AMS HT has
+  // one). unitId null means the external spools.
+  component SpoolRow: Row {
+    id: spoolRow
+    property var unitId: null
+    property var trays: []
+    readonly property real cell: width / 4
+
+    Repeater {
+      model: spoolRow.trays
+
+      Column {
+        id: slot
+        required property var modelData
+        readonly property bool active: root.isActiveTray(spoolRow.unitId, modelData)
+        width: spoolRow.cell
+        spacing: Style.space(4)
+
+        Spool {
+          anchors.horizontalCenter: parent.horizontalCenter
+          size: Style.space(30)
+          colors: slot.modelData.colors || []
+          empty: slot.modelData.empty === true
+          active: slot.active
+          foreground: root.foreground
+        }
+
+        Caption {
+          width: parent.width
+          text: root.trayLabel(slot.modelData)
+          color: slot.active ? root.foreground : root.dim
+          font.bold: slot.active
+          horizontalAlignment: Text.AlignHCenter
+          elide: Text.ElideRight
+        }
+      }
+    }
   }
 }

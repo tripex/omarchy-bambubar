@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "tripex.bambubar",
   "name": "BambuBar",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "tripex",
   "license": "MIT",
-  "description": "Live status of a Bambu Lab 3D printer in the Omarchy bar: progress, time left, temperatures and AMS humidity, straight from the printer on your network.",
+  "description": "Live status of a Bambu Lab 3D printer in the Omarchy bar: progress, time left, both nozzles, AMS spools in their colours, and a notification when a print ends, straight from the printer on your network.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,12 +14,13 @@
   },
   "barWidget": {
     "displayName": "BambuBar",
-    "description": "Bambu Lab printer status: progress and time left in the bar, job, layers, temperatures and AMS humidity in the panel.",
+    "description": "Bambu Lab printer status: progress and time left in the bar; job, layers, temperatures, AMS spools and humidity in the panel; notifications when a print finishes or fails.",
     "category": "Devices",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "showProgress": true,
+      "notify": true,
       "demo": false
     },
     "schema": [
@@ -27,6 +28,12 @@
         "key": "showProgress",
         "type": "boolean",
         "label": "Show progress and time left in the bar",
+        "defaultValue": true
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Notify when a print finishes or fails",
         "defaultValue": true
       },
       {

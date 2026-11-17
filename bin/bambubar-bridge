@@ -18,21 +18,30 @@ Commands (stdin)
         code to the system keyring (secret-tool), and reconnect. An empty
         accessCode keeps the stored one. The code arrives here rather than in
         argv because /proc/<pid>/cmdline is readable by other processes.
+    {"op":"trust"}         forget the pinned certificate and pin the one the
+                           printer presents now (it must still name the serial)
     {"op":"refresh"}       ask the printer for a full status dump again
 
 Events (stdout)
-    {"ev":"config","host":"...","serial":"...","hasCode":true,"demo":false}
-    {"ev":"status","status":"notConfigured|connecting|connected|denied|disconnected|failed","detail":"..."}
+    {"ev":"config","host":"...","serial":"...","hasCode":true,"fingerprint":"sha256 hex","demo":false}
+    {"ev":"status","status":"notConfigured|connecting|connected|denied|disconnected|failed|untrusted|wrongPrinter","detail":"..."}
     {"ev":"state", ...printer fields..., "totalPrintSeconds":123}
     {"ev":"saved","ok":true,"warning":"keyring"}   or   {"ev":"saved","ok":false,"error":"invalid-host"}
 
 Flags
     --demo      sample data, no printer or network needed (screenshots, UI work)
 
-The printer's certificate is not verified (it is self-signed), so only use
-this on a network you trust.
+Certificate pinning. The access code is the printer's only credential, and an
+IP address from DHCP says nothing about who answers there. The printer's
+certificate is self-signed by Bambu and names the printer's serial number, so
+the first connection only goes ahead when that name matches the configured
+serial; its SHA-256 fingerprint is then saved, and every later connection must
+present the same certificate before the access code is sent ("untrusted"
+otherwise). A different serial in the certificate means another device is
+answering at that address ("wrongPrinter").
 """
 
+import hashlib
 import json
 import math
 import os
@@ -52,6 +61,8 @@ sys.dont_write_bytecode = True
 PORT = 8883
 CONNECT_TIMEOUT = 8
 RECONNECT_SEC = 5
+# A device that isn't the pinned printer won't change its mind quickly.
+RECHECK_UNTRUSTED_SEC = 30
 PING_SEC = 30
 # The printer reports at least every few seconds and answers pings, so a
 # connection that has been silent this long is dead.
@@ -68,6 +79,8 @@ HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?)+$|^
 SERIAL_RE = re.compile(r"^[A-Za-z0-9]{1,32}$")
 CODE_RE = re.compile(r"^[\x21-\x7e]{1,64}$")
 STATE_RE = re.compile(r"^[A-Z_]{0,24}$")
+FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+COLOR_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +169,57 @@ def parse_publish(first, body):
 
 
 # ---------------------------------------------------------------------------
+# Certificates. Python's ssl module only describes a peer certificate it has
+# verified, and the printer's can't be verified, so the subject is read from
+# the DER bytes directly: just enough ASN.1 to walk to the subject's CN.
+
+def _der_items(data, start, end):
+    """Yield (tag, value start, value end) for each TLV between start and end."""
+    i = start
+    while i < end:
+        if i + 2 > end:
+            raise ValueError("truncated header")
+        tag, length = data[i], data[i + 1]
+        i += 2
+        if length & 0x80:
+            n = length & 0x7F
+            if n == 0 or n > 4 or i + n > end:
+                raise ValueError("bad length")
+            length = int.from_bytes(data[i:i + n], "big")
+            i += n
+        if i + length > end:
+            raise ValueError("truncated value")
+        yield tag, i, i + length
+        i += length
+
+
+def _first(data, start, end):
+    for item in _der_items(data, start, end):
+        return item
+    raise ValueError("empty")
+
+
+def cert_common_name(der):
+    """The subject CN of a DER certificate, or "" when there isn't one."""
+    try:
+        _, cs, ce = _first(der, 0, len(der))      # Certificate
+        _, ts, te = _first(der, cs, ce)           # TBSCertificate
+        fields = list(_der_items(der, ts, te))
+        if fields and fields[0][0] == 0xA0:       # explicit version
+            fields = fields[1:]
+        # serialNumber, signature, issuer, validity, subject
+        _, ss, se = fields[4]
+        for _, rs, re_ in _der_items(der, ss, se):            # RDN (SET)
+            for _, as_, ae in _der_items(der, rs, re_):       # AttributeTypeAndValue
+                parts = list(_der_items(der, as_, ae))
+                if len(parts) == 2 and parts[0][0] == 0x06 and der[parts[0][1]:parts[0][2]] == b"\x55\x04\x03":
+                    return der[parts[1][1]:parts[1][2]].decode("utf-8", "replace")
+    except (ValueError, IndexError):
+        pass
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Printer state. Every value comes from the network, so it is type-checked and
 # bounded before it reaches the shell.
 
@@ -180,11 +244,60 @@ def _text(v, limit=120):
     return v[:limit]
 
 
+def _color(v):
+    """Bambu colours are RRGGBBAA hex; "00000000" means unknown."""
+    if not isinstance(v, str) or not COLOR_RE.match(v) or v == "00000000":
+        return None
+    return "#" + v[:6].upper()
+
+
+def _id(v, digits=3):
+    if isinstance(v, int) and not isinstance(v, bool):
+        v = str(v)
+    if isinstance(v, str) and re.fullmatch(r"\d{1,%d}" % digits, v):
+        return str(int(v))
+    return None
+
+
+def new_tray(tid):
+    return {"id": tid, "type": "", "name": "", "colors": [], "empty": True}
+
+
+def apply_tray(tray, t):
+    """Merge one tray (an AMS slot or an external spool) into tray."""
+    if not (set(t) - {"id"}):
+        # The printer describes an empty slot by its id alone.
+        tray.update(type="", name="", colors=[], empty=True)
+        return tray
+    kind = _text(t.get("tray_type"), 16)
+    if kind is not None:
+        tray["type"] = kind
+    name = _text(t.get("tray_sub_brands"), 24)
+    if name is not None:
+        tray["name"] = name
+    cols = t.get("cols")
+    colors = [c for c in (_color(x) for x in cols[:4]) if c] if isinstance(cols, list) else []
+    if colors:
+        tray["colors"] = colors
+    elif "tray_color" in t:
+        c = _color(t.get("tray_color"))
+        tray["colors"] = [c] if c else []
+    tray["empty"] = not tray["type"] and not tray["colors"]
+    return tray
+
+
 def new_printer_state():
     return {
         "gcodeState": "", "percent": 0, "remainingMin": 0,
         "nozzle": 0.0, "nozzleTarget": 0.0, "bed": 0.0, "bedTarget": 0.0,
         "job": "", "layer": 0, "totalLayers": 0, "ams": [],
+        # Dual-nozzle printers (H2D, X2D): one entry per nozzle, id 0 = right,
+        # 1 = left, and which one is printing.
+        "nozzles": [], "activeNozzle": -1,
+        # External spools: vt_tray on single-nozzle printers, vir_slot on
+        # dual-nozzle ones.
+        "external": [],
+        "trayNow": None,
     }
 
 
@@ -215,27 +328,98 @@ def apply_report(state, p):
         state["job"] = job
 
     ams = p.get("ams")
+    if isinstance(ams, dict):
+        now = _int_text(ams.get("tray_now"), 0, 255)
+        if now is not None:
+            state["trayNow"] = now
     units = ams.get("ams") if isinstance(ams, dict) else None
     if isinstance(units, list):
         known = {u["id"]: u for u in state["ams"]}
         for u in units[:16]:
             if not isinstance(u, dict):
                 continue
-            uid = u.get("id")
-            if isinstance(uid, int) and not isinstance(uid, bool):
-                uid = str(uid)
-            if not isinstance(uid, str) or not re.fullmatch(r"\d{1,3}", uid):
+            uid = _id(u.get("id"))
+            if uid is None:
                 continue
-            unit = known.get(uid) or {"id": uid, "level": 0, "percent": None}
+            unit = known.get(uid) or {"id": uid, "level": 0, "percent": None, "trays": []}
             level = _int_text(u.get("humidity"), 0, 5)
             if level is not None:
                 unit["level"] = level
             raw = _int_text(u.get("humidity_raw"), 0, 100)
             if raw is not None:
                 unit["percent"] = raw
+            trays = u.get("tray")
+            if isinstance(trays, list):
+                slots = {t["id"]: t for t in unit["trays"]}
+                for t in trays[:4]:
+                    tid = _id(t.get("id"), 2) if isinstance(t, dict) else None
+                    if tid is not None:
+                        slots[tid] = apply_tray(slots.get(tid) or new_tray(tid), t)
+                unit["trays"] = sorted(slots.values(), key=lambda t: int(t["id"]))
             known[uid] = unit
         state["ams"] = sorted(known.values(), key=lambda u: int(u["id"]))[:16]
+
+    externals = p.get("vir_slot")
+    if isinstance(p.get("vt_tray"), dict) and not isinstance(externals, list):
+        externals = [p["vt_tray"]]
+    if isinstance(externals, list):
+        slots = {t["id"]: t for t in state["external"]}
+        for t in externals[:2]:
+            tid = _id(t.get("id")) if isinstance(t, dict) else None
+            if tid is not None:
+                slots[tid] = apply_tray(slots.get(tid) or new_tray(tid), t)
+        state["external"] = sorted(slots.values(), key=lambda t: int(t["id"]))
+
+    device = p.get("device")
+    extruder = device.get("extruder") if isinstance(device, dict) else None
+    if isinstance(extruder, dict):
+        st = _number(extruder.get("state"), 0, 0xFFFFFFFF)
+        if st is not None and (int(st) >> 4) & 0xF in (0, 1):  # 15 while switching
+            state["activeNozzle"] = (int(st) >> 4) & 0xF
+        info = extruder.get("info")
+        if isinstance(info, list):
+            nozzles = {n["id"]: n for n in state["nozzles"]}
+            for entry in info[:2]:
+                nid = entry.get("id") if isinstance(entry, dict) else None
+                if nid not in (0, 1) or isinstance(nid, bool):
+                    continue
+                n = nozzles.get(nid) or {"id": nid, "temp": 0, "target": 0, "source": None}
+                packed = _number(entry.get("temp"), 0, 0xFFFFFFFF)
+                if packed is not None:
+                    # Low word is the current temperature, high word the target.
+                    n["temp"] = min(int(packed) & 0xFFFF, 1000)
+                    n["target"] = min((int(packed) >> 16) & 0xFFFF, 1000)
+                source = _number(entry.get("snow"), 0, 0xFFFF)
+                if source is not None:
+                    n["source"] = int(source)
+                nozzles[nid] = n
+            state["nozzles"] = sorted(nozzles.values(), key=lambda n: n["id"])
     return state
+
+
+def active_spool(state):
+    """Which spool feeds the nozzle that is printing: {"ams": id, "tray": id},
+    {"external": id} or None."""
+    source = None
+    for n in state["nozzles"]:
+        if n["id"] == state["activeNozzle"]:
+            source = n["source"]
+    if source is not None:
+        # unit << 8 | tray; 0xFFFF is nothing loaded, units 254/255 the
+        # external spools.
+        if source == 0xFFFF:
+            return None
+        unit, tray = source >> 8, source & 0xFF
+    else:
+        now = state["trayNow"]
+        if now is None or now == 255:
+            return None
+        if now == 254:
+            return {"external": "254"}
+        unit, tray = (now, 0) if now >= 128 else (now >> 2, now & 3)
+    if unit in (254, 255):
+        return {"external": str(unit)}
+    return {"ams": str(unit), "tray": str(tray)}
 
 
 # ---------------------------------------------------------------------------
@@ -263,11 +447,18 @@ def load_config():
     data = _read_json(CONFIG_FILE)
     host = data.get("host") if isinstance(data.get("host"), str) else ""
     serial = data.get("serial") if isinstance(data.get("serial"), str) else ""
+    fingerprint = data.get("fingerprint") if isinstance(data.get("fingerprint"), str) else ""
     if not HOST_RE.match(host or "-") or len(host) > 253:
         host = ""
     if not SERIAL_RE.match(serial or "-"):
         serial = ""
-    return host, serial
+    if not FINGERPRINT_RE.match(fingerprint):
+        fingerprint = ""
+    return host, serial, fingerprint
+
+
+def save_config(host, serial, fingerprint):
+    _write_json(CONFIG_FILE, {"host": host, "serial": serial, "fingerprint": fingerprint})
 
 
 def load_total():
@@ -325,7 +516,7 @@ class Bridge:
     def __init__(self, stop, commands):
         self.stop = stop
         self.commands = commands
-        self.host, self.serial = load_config()
+        self.host, self.serial, self.fingerprint = load_config()
         self.code = keyring_lookup(self.serial) if self.serial else ""
         self.printer = new_printer_state()
         self.total = load_total()
@@ -350,7 +541,7 @@ class Bridge:
 
     def emit_config(self):
         emit({"ev": "config", "host": self.host, "serial": self.serial,
-              "hasCode": bool(self.code), "demo": False})
+              "hasCode": bool(self.code), "fingerprint": self.fingerprint, "demo": False})
 
     def set_status(self, status, detail=""):
         if (status, detail) == self.status:
@@ -361,23 +552,31 @@ class Bridge:
     def emit_state(self):
         event = {"ev": "state", "totalPrintSeconds": int(self.total)}
         event.update(self.printer)
+        del event["trayNow"]
+        event["activeSpool"] = active_spool(self.printer)
         emit(event)
 
     # -- connection
 
     def connect(self):
         self.close()
-        self.set_status("connecting")
+        # Retries after an error keep showing that error, so the panel doesn't
+        # flicker between it and "connecting" every few seconds.
+        if self.status is None or self.status[0] in ("connected", "disconnected", "notConfigured", "connecting"):
+            self.set_status("connecting")
         try:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE  # the printer's certificate is self-signed
+            # The certificate is self-signed by Bambu; check_identity() pins it instead.
+            ctx.verify_mode = ssl.CERT_NONE
             raw = socket.create_connection((self.host, PORT), timeout=CONNECT_TIMEOUT)
             try:
                 self.sock = ctx.wrap_socket(raw)
             except BaseException:
                 raw.close()
                 raise
+            if not self.check_identity(self.sock.getpeercert(binary_form=True) or b""):
+                return
             self.sock.settimeout(0.5)
             client_id = "bambubar-" + uuid.uuid4().hex[:8]
             self.sock.sendall(connect_packet(client_id, "bblp", self.code))
@@ -386,6 +585,27 @@ class Bridge:
             return
         now = time.monotonic()
         self.opened_at = self.last_rx = self.last_ping = now
+
+    def check_identity(self, der):
+        """Whether the access code may go to this peer. Pins the certificate the
+        first time, when it names the configured serial."""
+        fingerprint = hashlib.sha256(der).hexdigest()
+        name = re.sub(r"[^\x20-\x7e]", "?", cert_common_name(der))[:64]
+        if self.fingerprint:
+            if fingerprint == self.fingerprint:
+                return True
+            self.drop("untrusted", name, RECHECK_UNTRUSTED_SEC)
+            return False
+        if name.upper() != self.serial:
+            self.drop("wrongPrinter", name, RECHECK_UNTRUSTED_SEC)
+            return False
+        self.fingerprint = fingerprint
+        try:
+            save_config(self.host, self.serial, self.fingerprint)
+        except OSError:
+            pass  # still pinned for this session
+        self.emit_config()
+        return True
 
     def close(self):
         if self.sock is not None:
@@ -397,11 +617,11 @@ class Bridge:
         self.buf = bytearray()
         self.connected = False
 
-    def drop(self, status, detail=""):
+    def drop(self, status, detail="", retry_after=RECONNECT_SEC):
         self.close()
         self.set_status(status, detail)
         if self.wanted:
-            self.next_connect = time.monotonic() + RECONNECT_SEC
+            self.next_connect = time.monotonic() + retry_after
 
     def send(self, data):
         try:
@@ -479,6 +699,27 @@ class Bridge:
             self.request_full_state()
         elif op == "configure":
             self.configure(cmd)
+        elif op == "trust":
+            self.trust()
+
+    def trust(self):
+        """Pin whatever certificate the printer presents next (it must still
+        name the configured serial)."""
+        if not self.configured():
+            return
+        self.fingerprint = ""
+        try:
+            save_config(self.host, self.serial, "")
+        except OSError:
+            pass
+        self.emit_config()
+        self.restart_connection()
+
+    def restart_connection(self):
+        self.status = None
+        self.wanted = True
+        self.next_connect = 0.0
+        self.close()
 
     def configure(self, cmd):
         host = str(cmd.get("host") or "").strip()
@@ -502,21 +743,21 @@ class Bridge:
             if not code:
                 emit({"ev": "saved", "ok": False, "error": "code-missing"})
                 return
+        changed_printer = serial != self.serial
+        # The certificate identifies the printer, so a new address keeps the
+        # pin (and proves it is the same printer); a new serial starts over.
+        fingerprint = "" if changed_printer else self.fingerprint
         try:
-            _write_json(CONFIG_FILE, {"host": host, "serial": serial})
+            save_config(host, serial, fingerprint)
         except OSError:
             warning = warning or "config"
-        changed_printer = serial != self.serial
-        self.host, self.serial, self.code = host, serial, code
+        self.host, self.serial, self.code, self.fingerprint = host, serial, code, fingerprint
         if changed_printer:
             self.printer = new_printer_state()
             self.emit_state()
         emit({"ev": "saved", "ok": True, "warning": warning})
         self.emit_config()
-        self.status = None
-        self.wanted = True
-        self.next_connect = 0.0
-        self.close()
+        self.restart_connection()
 
     # -- print time
 
@@ -574,9 +815,14 @@ def describe(e):
 
 def run_demo(stop, commands):
     """A print in progress, for screenshots and UI work."""
-    emit({"ev": "config", "host": "192.168.1.50", "serial": "01P00A000000000", "hasCode": True, "demo": True})
+    emit({"ev": "config", "host": "192.168.1.50", "serial": "01P00A000000000", "hasCode": True,
+          "fingerprint": "", "demo": True})
     emit({"ev": "status", "status": "connected", "detail": ""})
     start = time.monotonic()
+
+    def spool(tid, kind, name, *colors):
+        return {"id": tid, "type": kind, "name": name, "colors": list(colors), "empty": not kind}
+
     while not stop.is_set():
         minutes = (time.monotonic() - start) / 60
         percent = min(99, 64 + int(minutes))
@@ -585,7 +831,17 @@ def run_demo(stop, commands):
             "remainingMin": max(1, 83 - int(minutes * 2)),
             "nozzle": 219.6, "nozzleTarget": 220.0, "bed": 60.0, "bedTarget": 60.0,
             "job": "Benchy_0.2mm_PLA", "layer": 142 + int(minutes * 2), "totalLayers": 222,
-            "ams": [{"id": "0", "level": 4, "percent": 24}],
+            "nozzles": [{"id": 0, "temp": 38, "target": 0, "source": None},
+                        {"id": 1, "temp": 220, "target": 220, "source": 1}],
+            "activeNozzle": 1,
+            "ams": [{"id": "0", "level": 4, "percent": 24, "trays": [
+                spool("0", "PLA", "PLA Basic", "#F5F5F5"),
+                spool("1", "PLA", "PLA Matte", "#00AE42"),
+                spool("2", "PLA", "PLA Silk+", "#C0C0C0", "#D4AF37"),
+                spool("3", "", ""),
+            ]}],
+            "external": [spool("254", "TPU", "", "#2B2B2B")],
+            "activeSpool": {"ams": "0", "tray": "1"},
             "totalPrintSeconds": 127 * 3600 + 42 * 60 + int(minutes * 60),
         }
         emit(state)

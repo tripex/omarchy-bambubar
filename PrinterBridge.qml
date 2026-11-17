@@ -16,10 +16,15 @@ Item {
   property string host: ""
   property string serial: ""
   property bool hasCode: false
+  // SHA-256 of the printer's pinned certificate, "" until the first connection.
+  property string fingerprint: ""
   property bool configLoaded: false
   property bool isDemo: false
 
-  // starting | notConfigured | connecting | connected | denied | disconnected | failed
+  // starting | notConfigured | connecting | connected | denied | disconnected |
+  // failed | untrusted (pinned certificate changed) | wrongPrinter (another
+  // serial answers at the address). statusDetail holds the serial the
+  // certificate names for the last two.
   property string status: "starting"
   property string statusDetail: ""
 
@@ -34,6 +39,13 @@ Item {
   property int currentLayer: 0
   property int totalLayers: 0
   property var ams: []
+  // Dual-nozzle printers: [{id: 0 (right) | 1 (left), temp, target}], and the one printing.
+  property var nozzles: []
+  property int activeNozzle: -1
+  // External spools [{id, type, name, colors, empty}] and the spool feeding
+  // the active nozzle: {ams, tray}, {external} or null.
+  property var external: []
+  property var activeSpool: null
   property real totalPrintSeconds: 0
 
   property bool saving: false
@@ -66,6 +78,11 @@ Item {
     send({ op: "refresh" })
   }
 
+  // Accept the certificate the printer presents now, after it changed.
+  function trust() {
+    send({ op: "trust" })
+  }
+
   function send(command) {
     if (!bridge.running || restarting) return false
     bridge.write(JSON.stringify(command) + "\n")
@@ -90,6 +107,7 @@ Item {
       host = String(ev.host || "")
       serial = String(ev.serial || "")
       hasCode = ev.hasCode === true
+      fingerprint = /^[0-9a-f]{64}$/.test(String(ev.fingerprint || "")) ? String(ev.fingerprint) : ""
       isDemo = ev.demo === true
       configLoaded = true
       configReceived()
@@ -108,6 +126,10 @@ Item {
       currentLayer = num(ev.layer, 0)
       totalLayers = num(ev.totalLayers, 0)
       ams = Array.isArray(ev.ams) ? ev.ams : []
+      nozzles = Array.isArray(ev.nozzles) ? ev.nozzles : []
+      activeNozzle = num(ev.activeNozzle, -1)
+      external = Array.isArray(ev.external) ? ev.external : []
+      activeSpool = ev.activeSpool && typeof ev.activeSpool === "object" ? ev.activeSpool : null
       totalPrintSeconds = num(ev.totalPrintSeconds, 0)
     } else if (ev.ev === "saved") {
       saving = false
