@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""Bridge between the Omarchy shell and a Bambu Lab printer on the local network.
+
+QML has no TLS socket, so the shell talks to the printer through this process.
+It speaks NDJSON (one JSON object per line) in both directions: the shell
+writes commands to our stdin and reads events from our stdout.
+
+Bambu Lab printers run an MQTT broker on port 8883 (TLS with a self-signed
+certificate, user "bblp", password = the access code). We subscribe to
+device/<serial>/report, ask for a full status dump ("pushall") and merge the
+partial updates that follow. The MQTT client below is just enough of MQTT
+3.1.1 for that (QoS 0), so there are no dependencies beyond the standard
+library.
+
+Commands (stdin)
+    {"op":"configure","host":"192.168.1.50","serial":"01P00A...","accessCode":"12345678"}
+        Save host and serial to ~/.config/bambubar/printer.json, the access
+        code to the system keyring (secret-tool), and reconnect. An empty
+        accessCode keeps the stored one. The code arrives here rather than in
+        argv because /proc/<pid>/cmdline is readable by other processes.
+    {"op":"refresh"}       ask the printer for a full status dump again
+
+Events (stdout)
+    {"ev":"config","host":"...","serial":"...","hasCode":true,"demo":false}
+    {"ev":"status","status":"notConfigured|connecting|connected|denied|disconnected|failed","detail":"..."}
+    {"ev":"state", ...printer fields..., "totalPrintSeconds":123}
+    {"ev":"saved","ok":true,"warning":"keyring"}   or   {"ev":"saved","ok":false,"error":"invalid-host"}
+
+Flags
+    --demo      sample data, no printer or network needed (screenshots, UI work)
+
+The printer's certificate is not verified (it is self-signed), so only use
+this on a network you trust.
+"""
+
+import json
+import math
+import os
+import queue
+import re
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+sys.dont_write_bytecode = True
+
+PORT = 8883
+CONNECT_TIMEOUT = 8
+RECONNECT_SEC = 5
+PING_SEC = 30
+# The printer reports at least every few seconds and answers pings, so a
+# connection that has been silent this long is dead.
+SILENCE_SEC = 75
+SAVE_TOTAL_SEC = 60
+MAX_PACKET = 2 * 1024 * 1024
+
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "bambubar")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "printer.json")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "bambubar")
+STATS_FILE = os.path.join(STATE_DIR, "stats.json")
+
+HOST_RE = re.compile(r"^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?)+$|^[0-9A-Fa-f:]{2,39}$")
+SERIAL_RE = re.compile(r"^[A-Za-z0-9]{1,32}$")
+CODE_RE = re.compile(r"^[\x21-\x7e]{1,64}$")
+STATE_RE = re.compile(r"^[A-Z_]{0,24}$")
+
+
+# ---------------------------------------------------------------------------
+# MQTT 3.1.1, QoS 0 only
+
+class ProtocolError(Exception):
+    pass
+
+
+def mqtt_string(s):
+    b = s.encode("utf-8")
+    return len(b).to_bytes(2, "big") + b
+
+
+def mqtt_packet(header, body):
+    out = bytearray([header])
+    n = len(body)
+    while True:
+        b = n % 128
+        n //= 128
+        if n:
+            b |= 0x80
+        out.append(b)
+        if not n:
+            break
+    return bytes(out) + body
+
+
+def connect_packet(client_id, user, password, keepalive=60):
+    # Protocol level 4, flags: username + password + clean session.
+    flags = bytes([0x04, 0xC2]) + keepalive.to_bytes(2, "big")
+    return mqtt_packet(0x10, mqtt_string("MQTT") + flags + mqtt_string(client_id)
+                       + mqtt_string(user) + mqtt_string(password))
+
+
+def subscribe_packet(topic, packet_id=1):
+    return mqtt_packet(0x82, packet_id.to_bytes(2, "big") + mqtt_string(topic) + b"\x00")
+
+
+def publish_packet(topic, payload):
+    return mqtt_packet(0x30, mqtt_string(topic) + payload)
+
+
+PINGREQ = b"\xc0\x00"
+
+
+def take_packets(buf):
+    """Remove every complete packet from buf (a bytearray) and return them as (first byte, body)."""
+    out = []
+    while len(buf) >= 2:
+        mult, rem, idx, complete = 1, 0, 1, False
+        while idx < len(buf) and idx <= 4:
+            b = buf[idx]
+            idx += 1
+            rem += (b & 0x7F) * mult
+            mult *= 128
+            if not b & 0x80:
+                complete = True
+                break
+        if not complete:
+            if idx > 4:
+                raise ProtocolError("malformed remaining length")
+            break
+        if rem > MAX_PACKET:
+            raise ProtocolError("packet too large")
+        if len(buf) < idx + rem:
+            break
+        out.append((buf[0], bytes(buf[idx:idx + rem])))
+        del buf[:idx + rem]
+    return out
+
+
+def parse_publish(first, body):
+    """Topic and payload of a PUBLISH packet, or None when it is malformed."""
+    if len(body) < 2:
+        return None
+    tl = int.from_bytes(body[0:2], "big")
+    if len(body) < 2 + tl:
+        return None
+    topic = body[2:2 + tl].decode("utf-8", "replace")
+    qos = (first >> 1) & 3
+    off = 2 + tl + (2 if qos else 0)
+    if len(body) < off:
+        return None
+    return topic, body[off:]
+
+
+# ---------------------------------------------------------------------------
+# Printer state. Every value comes from the network, so it is type-checked and
+# bounded before it reaches the shell.
+
+def _number(v, lo, hi):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        return None
+    return max(lo, min(hi, v))
+
+
+def _int_text(v, lo, hi):
+    """AMS fields arrive as strings ("4"), sometimes as numbers."""
+    if isinstance(v, str) and re.fullmatch(r"-?\d{1,6}", v.strip()):
+        v = int(v.strip())
+    n = _number(v, lo, hi)
+    return None if n is None else int(n)
+
+
+def _text(v, limit=120):
+    if not isinstance(v, str):
+        return None
+    v = re.sub(r"[\x00-\x1f\x7f]", " ", v).strip()
+    return v[:limit]
+
+
+def new_printer_state():
+    return {
+        "gcodeState": "", "percent": 0, "remainingMin": 0,
+        "nozzle": 0.0, "nozzleTarget": 0.0, "bed": 0.0, "bedTarget": 0.0,
+        "job": "", "layer": 0, "totalLayers": 0, "ams": [],
+    }
+
+
+def apply_report(state, p):
+    """Merge one "print" report into state. The printer sends partial updates,
+    so only keys that are present are overwritten."""
+    v = p.get("gcode_state")
+    if isinstance(v, str) and STATE_RE.match(v):
+        state["gcodeState"] = v
+    for key, field, lo, hi in (
+        ("mc_percent", "percent", 0, 100),
+        ("mc_remaining_time", "remainingMin", 0, 100000),
+        ("layer_num", "layer", 0, 1000000),
+        ("total_layer_num", "totalLayers", 0, 1000000),
+    ):
+        n = _number(p.get(key), lo, hi)
+        if n is not None:
+            state[field] = int(n)
+    for key, field in (
+        ("nozzle_temper", "nozzle"), ("nozzle_target_temper", "nozzleTarget"),
+        ("bed_temper", "bed"), ("bed_target_temper", "bedTarget"),
+    ):
+        n = _number(p.get(key), -100, 1000)
+        if n is not None:
+            state[field] = round(float(n), 1)
+    job = _text(p.get("subtask_name"))
+    if job is not None:
+        state["job"] = job
+
+    ams = p.get("ams")
+    units = ams.get("ams") if isinstance(ams, dict) else None
+    if isinstance(units, list):
+        known = {u["id"]: u for u in state["ams"]}
+        for u in units[:16]:
+            if not isinstance(u, dict):
+                continue
+            uid = u.get("id")
+            if isinstance(uid, int) and not isinstance(uid, bool):
+                uid = str(uid)
+            if not isinstance(uid, str) or not re.fullmatch(r"\d{1,3}", uid):
+                continue
+            unit = known.get(uid) or {"id": uid, "level": 0, "percent": None}
+            level = _int_text(u.get("humidity"), 0, 5)
+            if level is not None:
+                unit["level"] = level
+            raw = _int_text(u.get("humidity_raw"), 0, 100)
+            if raw is not None:
+                unit["percent"] = raw
+            known[uid] = unit
+        state["ams"] = sorted(known.values(), key=lambda u: int(u["id"]))[:16]
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Storage
+
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def _read_json(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_config():
+    data = _read_json(CONFIG_FILE)
+    host = data.get("host") if isinstance(data.get("host"), str) else ""
+    serial = data.get("serial") if isinstance(data.get("serial"), str) else ""
+    if not HOST_RE.match(host or "-") or len(host) > 253:
+        host = ""
+    if not SERIAL_RE.match(serial or "-"):
+        serial = ""
+    return host, serial
+
+
+def load_total():
+    n = _number(_read_json(STATS_FILE).get("totalPrintSeconds"), 0, 1e10)
+    return float(n or 0)
+
+
+def keyring_lookup(serial):
+    try:
+        r = subprocess.run(["secret-tool", "lookup", "service", "bambubar", "serial", serial],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def keyring_store(serial, code):
+    try:
+        r = subprocess.run(["secret-tool", "store", "--label=BambuBar access code (%s)" % serial,
+                            "service", "bambubar", "serial", serial],
+                           input=code, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+
+def emit(event):
+    try:
+        sys.stdout.write(json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError):
+        # The shell went away; nothing left to report to.
+        os._exit(0)
+
+
+def read_commands(commands, stop):
+    """Runs on its own thread: stdin lines become commands, EOF ends the bridge."""
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            cmd = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(cmd, dict):
+            commands.put(cmd)
+    stop.set()
+    commands.put({"op": "wake"})
+
+
+class Bridge:
+    def __init__(self, stop, commands):
+        self.stop = stop
+        self.commands = commands
+        self.host, self.serial = load_config()
+        self.code = keyring_lookup(self.serial) if self.serial else ""
+        self.printer = new_printer_state()
+        self.total = load_total()
+        self.saved_total = self.total
+        self.last_tick = time.monotonic()
+        self.last_save = self.last_tick
+
+        self.sock = None
+        self.buf = bytearray()
+        self.connected = False
+        self.wanted = self.configured()
+        self.next_connect = 0.0
+        self.opened_at = 0.0
+        self.last_rx = 0.0
+        self.last_ping = 0.0
+        self.status = None
+
+    def configured(self):
+        return bool(self.host and self.serial and self.code)
+
+    # -- events
+
+    def emit_config(self):
+        emit({"ev": "config", "host": self.host, "serial": self.serial,
+              "hasCode": bool(self.code), "demo": False})
+
+    def set_status(self, status, detail=""):
+        if (status, detail) == self.status:
+            return
+        self.status = (status, detail)
+        emit({"ev": "status", "status": status, "detail": detail[:200]})
+
+    def emit_state(self):
+        event = {"ev": "state", "totalPrintSeconds": int(self.total)}
+        event.update(self.printer)
+        emit(event)
+
+    # -- connection
+
+    def connect(self):
+        self.close()
+        self.set_status("connecting")
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE  # the printer's certificate is self-signed
+            raw = socket.create_connection((self.host, PORT), timeout=CONNECT_TIMEOUT)
+            try:
+                self.sock = ctx.wrap_socket(raw)
+            except BaseException:
+                raw.close()
+                raise
+            self.sock.settimeout(0.5)
+            client_id = "bambubar-" + uuid.uuid4().hex[:8]
+            self.sock.sendall(connect_packet(client_id, "bblp", self.code))
+        except (OSError, ssl.SSLError) as e:
+            self.drop("failed", describe(e))
+            return
+        now = time.monotonic()
+        self.opened_at = self.last_rx = self.last_ping = now
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.buf = bytearray()
+        self.connected = False
+
+    def drop(self, status, detail=""):
+        self.close()
+        self.set_status(status, detail)
+        if self.wanted:
+            self.next_connect = time.monotonic() + RECONNECT_SEC
+
+    def send(self, data):
+        try:
+            self.sock.sendall(data)
+        except (OSError, ssl.SSLError) as e:
+            self.drop("disconnected", describe(e))
+
+    def request_full_state(self):
+        if self.sock is not None and self.connected:
+            req = b'{"pushing":{"sequence_id":"0","command":"pushall"}}'
+            self.send(publish_packet("device/%s/request" % self.serial, req))
+
+    def handle_packet(self, first, body):
+        kind = first >> 4
+        if kind == 2:  # CONNACK
+            if len(body) >= 2 and body[1] == 0:
+                self.connected = True
+                self.set_status("connected")
+                self.send(subscribe_packet("device/%s/report" % self.serial))
+                self.request_full_state()
+            else:
+                # Wrong access code (or LAN mode off). Retrying won't help until
+                # the settings change.
+                self.wanted = False
+                self.drop("denied")
+        elif kind == 3:  # PUBLISH
+            msg = parse_publish(first, body)
+            if msg is None:
+                return
+            try:
+                obj = json.loads(msg[1])
+            except ValueError:
+                return
+            report = obj.get("print") if isinstance(obj, dict) else None
+            if isinstance(report, dict):
+                apply_report(self.printer, report)
+                self.emit_state()
+
+    def pump(self):
+        try:
+            data = self.sock.recv(65536)
+        except (socket.timeout, ssl.SSLWantReadError):
+            data = None
+        except (OSError, ssl.SSLError) as e:
+            self.drop("disconnected", describe(e))
+            return
+        now = time.monotonic()
+        if data is not None:
+            if not data:
+                self.drop("disconnected")
+                return
+            self.last_rx = now
+            self.buf.extend(data)
+            try:
+                for first, body in take_packets(self.buf):
+                    self.handle_packet(first, body)
+                    if self.sock is None:
+                        return
+            except ProtocolError as e:
+                self.drop("disconnected", str(e))
+                return
+        if not self.connected and now - self.opened_at > CONNECT_TIMEOUT * 2:
+            self.drop("failed", "no answer from the printer's MQTT broker")
+        elif now - self.last_rx > SILENCE_SEC:
+            self.drop("disconnected", "connection timed out")
+        elif self.connected and now - self.last_ping >= PING_SEC:
+            self.last_ping = now
+            self.send(PINGREQ)
+
+    # -- commands
+
+    def handle_command(self, cmd):
+        op = cmd.get("op")
+        if op == "refresh":
+            self.request_full_state()
+        elif op == "configure":
+            self.configure(cmd)
+
+    def configure(self, cmd):
+        host = str(cmd.get("host") or "").strip()
+        serial = str(cmd.get("serial") or "").strip().upper()
+        code = str(cmd.get("accessCode") or "").strip()
+        if not host or len(host) > 253 or not HOST_RE.match(host):
+            emit({"ev": "saved", "ok": False, "error": "invalid-host"})
+            return
+        if not SERIAL_RE.match(serial):
+            emit({"ev": "saved", "ok": False, "error": "invalid-serial"})
+            return
+        if code and not CODE_RE.match(code):
+            emit({"ev": "saved", "ok": False, "error": "invalid-code"})
+            return
+        warning = ""
+        if code:
+            if not keyring_store(serial, code):
+                warning = "keyring"  # still used for this session
+        else:
+            code = self.code if serial == self.serial else keyring_lookup(serial)
+            if not code:
+                emit({"ev": "saved", "ok": False, "error": "code-missing"})
+                return
+        try:
+            _write_json(CONFIG_FILE, {"host": host, "serial": serial})
+        except OSError:
+            warning = warning or "config"
+        changed_printer = serial != self.serial
+        self.host, self.serial, self.code = host, serial, code
+        if changed_printer:
+            self.printer = new_printer_state()
+            self.emit_state()
+        emit({"ev": "saved", "ok": True, "warning": warning})
+        self.emit_config()
+        self.status = None
+        self.wanted = True
+        self.next_connect = 0.0
+        self.close()
+
+    # -- print time
+
+    def tick(self, force_save=False):
+        now = time.monotonic()
+        if self.connected and self.printer["gcodeState"] == "RUNNING":
+            self.total += now - self.last_tick
+        self.last_tick = now
+        if (force_save or now - self.last_save >= SAVE_TOTAL_SEC) and self.total != self.saved_total:
+            self.last_save = now
+            try:
+                _write_json(STATS_FILE, {"totalPrintSeconds": round(self.total)})
+                self.saved_total = self.total
+            except OSError:
+                pass
+            if not force_save:
+                self.emit_state()
+
+    def run(self):
+        self.emit_config()
+        self.emit_state()
+        if not self.configured():
+            self.set_status("notConfigured")
+        while not self.stop.is_set():
+            if self.wanted and self.sock is None and time.monotonic() >= self.next_connect:
+                self.connect()
+            if self.sock is not None:
+                self.pump()
+                block = False
+            else:
+                block = True
+            try:
+                cmd = self.commands.get(timeout=0.5) if block else self.commands.get_nowait()
+                while True:
+                    self.handle_command(cmd)
+                    cmd = self.commands.get_nowait()
+            except queue.Empty:
+                pass
+            self.tick()
+        self.tick(force_save=True)
+        self.close()
+
+
+def describe(e):
+    if isinstance(e, socket.timeout):
+        return "timed out"
+    if isinstance(e, ssl.SSLError):
+        return "TLS: " + (e.reason or str(e))
+    if isinstance(e, OSError) and e.strerror:
+        return e.strerror
+    return str(e) or e.__class__.__name__
+
+
+# ---------------------------------------------------------------------------
+
+def run_demo(stop, commands):
+    """A print in progress, for screenshots and UI work."""
+    emit({"ev": "config", "host": "192.168.1.50", "serial": "01P00A000000000", "hasCode": True, "demo": True})
+    emit({"ev": "status", "status": "connected", "detail": ""})
+    start = time.monotonic()
+    while not stop.is_set():
+        minutes = (time.monotonic() - start) / 60
+        percent = min(99, 64 + int(minutes))
+        state = {
+            "ev": "state", "gcodeState": "RUNNING", "percent": percent,
+            "remainingMin": max(1, 83 - int(minutes * 2)),
+            "nozzle": 219.6, "nozzleTarget": 220.0, "bed": 60.0, "bedTarget": 60.0,
+            "job": "Benchy_0.2mm_PLA", "layer": 142 + int(minutes * 2), "totalLayers": 222,
+            "ams": [{"id": "0", "level": 4, "percent": 24}],
+            "totalPrintSeconds": 127 * 3600 + 42 * 60 + int(minutes * 60),
+        }
+        emit(state)
+        try:
+            cmd = commands.get(timeout=5)
+            if cmd.get("op") == "configure":
+                emit({"ev": "saved", "ok": False, "error": "demo"})
+        except queue.Empty:
+            pass
+
+
+def main():
+    stop = threading.Event()
+    commands = queue.Queue()
+
+    def on_signal(*_):
+        stop.set()
+        commands.put({"op": "wake"})
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    threading.Thread(target=read_commands, args=(commands, stop), daemon=True).start()
+
+    if "--demo" in sys.argv[1:]:
+        run_demo(stop, commands)
+    else:
+        Bridge(stop, commands).run()
+
+
+if __name__ == "__main__":
+    main()

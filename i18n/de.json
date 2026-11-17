@@ -1,0 +1,58 @@
+{
+  "state.printing": "Druckt",
+  "state.preparing": "Bereitet vor",
+  "state.paused": "Pausiert",
+  "state.finished": "Fertig",
+  "state.failed": "Fehlgeschlagen",
+  "state.idle": "Bereit",
+
+  "conn.starting": "Startet …",
+  "conn.notConfigured": "Nicht konfiguriert",
+  "conn.connecting": "Verbinde …",
+  "conn.connected": "Verbunden",
+  "conn.demo": "Demo",
+  "conn.denied": "Login abgelehnt – Access Code prüfen",
+  "conn.disconnected": "Verbindung getrennt",
+  "conn.failed": "Fehler: %1",
+
+  "bar.progress": "%1% · %2",
+  "bar.paused": "Pause",
+  "bar.done": "Fertig",
+  "bar.failed": "Fehler",
+
+  "time.hoursMinutes": "%1h %2m",
+  "time.minutes": "%1m",
+
+  "print.layer": "Layer %1/%2",
+  "print.left": "noch %1",
+  "temp.nozzle": "Düse %1° / %2°",
+  "temp.bed": "Bett %1° / %2°",
+  "ams.humidity": "AMS %1 Feuchte",
+  "ams.level": "Stufe %1/5",
+  "total.label": "Druckzeit gesamt",
+  "total.hint": "Gezählt, während BambuBar läuft; der Drucker meldet seine Gesamtstunden nicht.",
+  "hint.keys": "r aktualisieren · s Einstellungen · esc schließen",
+
+  "action.refresh": "Aktualisieren (r)",
+  "action.settings": "Einstellungen (s)",
+
+  "form.title": "Drucker",
+  "form.intro": "Der Drucker muss im LAN-Modus sein. IP-Adresse, Seriennummer und Access Code stehen auf dem Druckerdisplay unter Settings → WLAN / Device.",
+  "form.host": "IP-Adresse",
+  "form.serial": "Seriennummer",
+  "form.code": "Access Code",
+  "form.codeKeep": "Leer lassen, um den gespeicherten Code zu behalten",
+  "form.keyring": "Der Access Code liegt in deinem Schlüsselbund.",
+  "form.save": "Speichern",
+  "form.saving": "Speichert …",
+  "form.cancel": "Abbrechen",
+
+  "error.invalid-host": "Das ist keine gültige IP-Adresse und kein gültiger Hostname.",
+  "error.invalid-serial": "Die Seriennummer darf nur Buchstaben und Ziffern enthalten.",
+  "error.invalid-code": "Der Access Code darf keine Leerzeichen enthalten.",
+  "error.code-missing": "Bitte den Access Code eingeben.",
+  "error.demo": "Im Demo-Modus lassen sich die Einstellungen nicht ändern.",
+  "error.bridge": "Das BambuBar-Hilfsprogramm läuft nicht. Bitte gleich noch einmal versuchen.",
+  "warning.keyring": "Gespeichert, aber der Access Code konnte nicht in den Schlüsselbund, daher musst du ihn nach einem Neustart erneut eingeben.",
+  "warning.config": "Verbunden, aber die Einstellungsdatei konnte nicht geschrieben werden, daher musst du sie nach einem Neustart erneut eingeben."
+}

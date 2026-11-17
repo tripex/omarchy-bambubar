@@ -1,0 +1,58 @@
+{
+  "state.printing": "Printing",
+  "state.preparing": "Preparing",
+  "state.paused": "Paused",
+  "state.finished": "Finished",
+  "state.failed": "Failed",
+  "state.idle": "Idle",
+
+  "conn.starting": "Starting…",
+  "conn.notConfigured": "Not set up",
+  "conn.connecting": "Connecting…",
+  "conn.connected": "Connected",
+  "conn.demo": "Demo",
+  "conn.denied": "Login rejected – check the access code",
+  "conn.disconnected": "Disconnected",
+  "conn.failed": "Error: %1",
+
+  "bar.progress": "%1% · %2",
+  "bar.paused": "Paused",
+  "bar.done": "Done",
+  "bar.failed": "Failed",
+
+  "time.hoursMinutes": "%1h %2m",
+  "time.minutes": "%1m",
+
+  "print.layer": "Layer %1/%2",
+  "print.left": "%1 left",
+  "temp.nozzle": "Nozzle %1° / %2°",
+  "temp.bed": "Bed %1° / %2°",
+  "ams.humidity": "AMS %1 humidity",
+  "ams.level": "Level %1/5",
+  "total.label": "Total print time",
+  "total.hint": "Counted while BambuBar is running; the printer doesn't report its lifetime hours.",
+  "hint.keys": "r refresh · s settings · esc close",
+
+  "action.refresh": "Refresh (r)",
+  "action.settings": "Settings (s)",
+
+  "form.title": "Printer",
+  "form.intro": "The printer must be in LAN mode. IP address, serial number and access code are on the printer's screen under Settings → WLAN / Device.",
+  "form.host": "IP address",
+  "form.serial": "Serial number",
+  "form.code": "Access code",
+  "form.codeKeep": "Leave empty to keep the saved code",
+  "form.keyring": "The access code is kept in your keyring.",
+  "form.save": "Save",
+  "form.saving": "Saving…",
+  "form.cancel": "Cancel",
+
+  "error.invalid-host": "That isn't a valid IP address or host name.",
+  "error.invalid-serial": "The serial number can only contain letters and digits.",
+  "error.invalid-code": "The access code can't contain spaces.",
+  "error.code-missing": "Enter the access code.",
+  "error.demo": "Settings can't be changed in demo mode.",
+  "error.bridge": "The BambuBar helper isn't running. Try again in a moment.",
+  "warning.keyring": "Saved, but the access code couldn't go into the keyring, so you'll have to enter it again after a restart.",
+  "warning.config": "Connected, but the settings file couldn't be written, so you'll have to enter them again after a restart."
+}

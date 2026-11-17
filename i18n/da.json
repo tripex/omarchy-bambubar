@@ -1,0 +1,58 @@
+{
+  "state.printing": "Printer",
+  "state.preparing": "Forbereder",
+  "state.paused": "Pauset",
+  "state.finished": "Færdig",
+  "state.failed": "Fejlet",
+  "state.idle": "Klar",
+
+  "conn.starting": "Starter …",
+  "conn.notConfigured": "Ikke sat op",
+  "conn.connecting": "Forbinder …",
+  "conn.connected": "Forbundet",
+  "conn.demo": "Demo",
+  "conn.denied": "Login afvist – tjek access code",
+  "conn.disconnected": "Forbindelsen er afbrudt",
+  "conn.failed": "Fejl: %1",
+
+  "bar.progress": "%1% · %2",
+  "bar.paused": "Pause",
+  "bar.done": "Færdig",
+  "bar.failed": "Fejl",
+
+  "time.hoursMinutes": "%1t %2m",
+  "time.minutes": "%1m",
+
+  "print.layer": "Lag %1/%2",
+  "print.left": "%1 tilbage",
+  "temp.nozzle": "Dyse %1° / %2°",
+  "temp.bed": "Plade %1° / %2°",
+  "ams.humidity": "AMS %1 fugt",
+  "ams.level": "Niveau %1/5",
+  "total.label": "Samlet printtid",
+  "total.hint": "Tælles mens BambuBar kører; printeren oplyser ikke sine samlede timer.",
+  "hint.keys": "r opdater · s indstillinger · esc luk",
+
+  "action.refresh": "Opdater (r)",
+  "action.settings": "Indstillinger (s)",
+
+  "form.title": "Printer",
+  "form.intro": "Printeren skal være i LAN-tilstand. IP-adresse, serienummer og access code står på printerens skærm under Settings → WLAN / Device.",
+  "form.host": "IP-adresse",
+  "form.serial": "Serienummer",
+  "form.code": "Access code",
+  "form.codeKeep": "Lad feltet stå tomt for at beholde den gemte kode",
+  "form.keyring": "Access code gemmes i din nøglering.",
+  "form.save": "Gem",
+  "form.saving": "Gemmer …",
+  "form.cancel": "Annuller",
+
+  "error.invalid-host": "Det er ikke en gyldig IP-adresse eller et gyldigt værtsnavn.",
+  "error.invalid-serial": "Serienummeret må kun indeholde bogstaver og tal.",
+  "error.invalid-code": "Access code må ikke indeholde mellemrum.",
+  "error.code-missing": "Indtast access code.",
+  "error.demo": "Indstillingerne kan ikke ændres i demotilstand.",
+  "error.bridge": "BambuBars hjælpeprogram kører ikke. Prøv igen om et øjeblik.",
+  "warning.keyring": "Gemt, men access code kunne ikke lægges i nøgleringen, så du skal indtaste den igen efter en genstart.",
+  "warning.config": "Forbundet, men indstillingsfilen kunne ikke skrives, så du skal indtaste dem igen efter en genstart."
+}
